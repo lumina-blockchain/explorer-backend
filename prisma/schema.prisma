@@ -1,0 +1,58 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Block {
+  height             BigInt        @id
+  hash               String        @unique
+  tx_count           Int
+  timestamp          BigInt
+  leader             String
+  leader_name        String
+  circulating_supply String
+  total_supply       String
+  confirmed_tps      Float
+  inbound_tps        Float
+  total_transactions BigInt
+  consensus_time_ms  BigInt
+  commit_time_ms     Float
+  block_time_ms      Float
+  aups               Float
+  persistence_lag    BigInt
+  reward             String
+  fees               String        @default("0")
+  parent_qc          String?       // JSON string of parent_qc
+  transactions       Transaction[]
+}
+
+model Transaction {
+  hash         String  @id
+  block_height BigInt
+  from         String
+  from_name    String
+  to           String
+  to_name      String
+  value        String
+  nonce        BigInt  @default(0)
+  status       String
+  method       String
+  token_info   String? // JSON string of token_info
+  block        Block   @relation(fields: [block_height], references: [height], onDelete: Cascade)
+}
+
+model Account {
+  address           String  @id
+  balance           String  @default("0")
+  staked            String  @default("0")
+  nonce             BigInt  @default(0)
+  name              String  @default("")
+  is_validator      Boolean @default(false)
+  validator_status  String  @default("None")
+  updated_at_block  BigInt  @default(0)
+}
+
