@@ -658,8 +658,8 @@ app.get("/search", async (req, res) => {
       return res.json({ type: "Transaction", url: `/tx/${query}` });
     }
 
-    // Jika format address (Bech32 dimulai dengan 'lumina1' atau '0x')
-    if (query.startsWith("lumina1") || query.startsWith("0x")) {
+    // Jika format address (Bech32 dimulai dengan prefix apapun seperti big1/lumina1, atau 0x hex)
+    if (/^[a-z][a-z0-9]{0,19}1[a-z0-9]{6,}$/i.test(query) || query.startsWith("0x")) {
       return res.json({ type: "Address", url: `/address/${query}` });
     }
 
