@@ -28,31 +28,63 @@ model Block {
   fees               String        @default("0")
   parent_qc          String?       // JSON string of parent_qc
   transactions       Transaction[]
+
+  @@index([leader])
 }
 
 model Transaction {
-  hash         String  @id
-  block_height BigInt
-  from         String
-  from_name    String
-  to           String
-  to_name      String
-  value        String
-  nonce        BigInt  @default(0)
-  status       String
-  method       String
-  token_info   String? // JSON string of token_info
-  block        Block   @relation(fields: [block_height], references: [height], onDelete: Cascade)
+  hash                 String  @id
+  block_height         BigInt
+  from                 String
+  from_name            String
+  to                   String
+  to_name              String
+  value                String
+  nonce                BigInt  @default(0)
+  status               String
+  method               String
+  token_info           String? // JSON string of token_info
+  token_recipient      String?
+  data                 String  @default("")
+  signature            String  @default("")
+  pubkey               String  @default("")
+  fee_payer            String?
+  fee_payer_name       String?
+  fee_payer_signature  String?
+  fee_payer_pubkey     String?
+  fee                  String  @default("0")
+  block                Block   @relation(fields: [block_height], references: [height], onDelete: Cascade)
+
+  @@index([from])
+  @@index([to])
+  @@index([block_height])
+  @@index([token_recipient])
 }
 
 model Account {
-  address           String  @id
-  balance           String  @default("0")
-  staked            String  @default("0")
-  nonce             BigInt  @default(0)
-  name              String  @default("")
-  is_validator      Boolean @default(false)
-  validator_status  String  @default("None")
-  updated_at_block  BigInt  @default(0)
+  address                String  @id
+  balance                String  @default("0")
+  staked                 String  @default("0")
+  nonce                  BigInt  @default(0)
+  name                   String  @default("")
+  is_validator           Boolean @default(false)
+  validator_status       String  @default("None")
+  updated_at_block       BigInt  @default(0)
+  stake_height           BigInt  @default(0)
+  vesting_initial_amount String  @default("0")
+  vesting_lock_height    BigInt  @default(0)
 }
 
+model Contract {
+  address      String  @id
+  tx_hash      String
+  block_height BigInt
+  bytecode     String
+  name         String?
+  symbol       String?
+  decimals     Int?
+  total_supply String?
+  owner        String?
+  logo         String?
+  created_at   BigInt
+}

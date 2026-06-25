@@ -1,5 +1,7 @@
 import WebSocket from "ws";
 import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
 import redis, { redisPub } from "./redis";
 import prisma from "./db";
 import { producer, consumer, connectKafka, ensureTopicExists } from "./kafka";
@@ -31,6 +33,14 @@ type NodeTransactionPayload = {
   status?: string;
   method?: string;
   token_info?: unknown;
+  data?: string;
+  signature?: string;
+  pubkey?: string;
+  fee?: string;
+  fee_payer?: string;
+  fee_payer_name?: string;
+  fee_payer_signature?: string;
+  fee_payer_pubkey?: string;
 };
 
 type NodeBlockPayload = {
@@ -89,6 +99,16 @@ function normalizeAddress(address: string | null | undefined): string | null {
   return trimmed.length >= 5 ? trimmed : null;
 }
 
+function parseTokenInfo(raw: any): any {
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function upsertObservedAccounts(addresses: Iterable<string>, currentBlockHeight: bigint) {
   const uniqueAddresses = Array.from(
     new Set(
@@ -119,14 +139,13 @@ async function upsertObservedAccounts(addresses: Iterable<string>, currentBlockH
       data: { updated_at_block: currentBlockHeight },
     }),
   ]);
-
-  await redis.del(TOTAL_ACCOUNTS_KEY);
 }
 
 async function upsertAccountStateFromNode(address: string, currentBlockHeight: bigint) {
   if (!address || address.length < 5) return;
   try {
-    const acc = await fetchNodeJson<NodeAccountState>(`/balance/${address}`);
+    const acc = await fetchNodeJson<any>(`/balance/${address}`);
+    const vesting = acc.vesting_schedule;
     await prisma.account.upsert({
       where: { address },
       update: {
@@ -137,6 +156,9 @@ async function upsertAccountStateFromNode(address: string, currentBlockHeight: b
         is_validator: acc.is_validator,
         validator_status: acc.validator_status || "None",
         updated_at_block: currentBlockHeight,
+        stake_height: BigInt(acc.stake_height ?? 0),
+        vesting_initial_amount: vesting?.initial_amount || "0",
+        vesting_lock_height: BigInt(vesting?.lock_height ?? 0),
       },
       create: {
         address,
@@ -147,6 +169,9 @@ async function upsertAccountStateFromNode(address: string, currentBlockHeight: b
         is_validator: acc.is_validator,
         validator_status: acc.validator_status || "None",
         updated_at_block: currentBlockHeight,
+        stake_height: BigInt(acc.stake_height ?? 0),
+        vesting_initial_amount: vesting?.initial_amount || "0",
+        vesting_lock_height: BigInt(vesting?.lock_height ?? 0),
       },
     });
   } catch (err: any) {
@@ -154,9 +179,138 @@ async function upsertAccountStateFromNode(address: string, currentBlockHeight: b
   }
 }
 
-async function bootstrapObservedAccounts() {
-  console.log("👤 Bootstrapping observed account registry from PostgreSQL...");
+async function registerGenesisAccounts() {
+  console.log("📂 Registering genesis accounts in database...");
+  const searchPaths = [
+    process.env.GENESIS_PATH,
+    path.join(__dirname, "../genesis.json"),
+    path.join(__dirname, "../../genesis.json"),
+    "/home/ubuntu/lumina-node/genesis.json",
+    "./genesis.json"
+  ].filter(Boolean) as string[];
+
+  let genesisData: any = null;
+  for (const p of searchPaths) {
+    try {
+      const resolvedPath = path.resolve(p);
+      if (fs.existsSync(resolvedPath)) {
+        console.log(`📖 Found genesis file at: ${resolvedPath}`);
+        const content = fs.readFileSync(resolvedPath, "utf-8");
+        genesisData = JSON.parse(content);
+        break;
+      }
+    } catch (err) {
+      // ignore and try next path
+    }
+  }
+
+  if (!genesisData) {
+    console.warn("⚠️ genesis.json not found in any search path. Skipping genesis accounts registration.");
+    return;
+  }
+
+  const genesisAddresses = new Set<string>();
+
+  // Extract from initial_balances
+  if (Array.isArray(genesisData.initial_balances)) {
+    for (const entry of genesisData.initial_balances) {
+      if (entry.address) genesisAddresses.add(entry.address);
+    }
+  }
+
+  // Extract from validators
+  if (Array.isArray(genesisData.validators)) {
+    for (const validator of genesisData.validators) {
+      if (validator.address) genesisAddresses.add(validator.address);
+    }
+  }
+
+  // Extract from vesting_schedules
+  if (Array.isArray(genesisData.vesting_schedules)) {
+    for (const schedule of genesisData.vesting_schedules) {
+      if (schedule.address) genesisAddresses.add(schedule.address);
+    }
+  }
+
+  console.log(`👤 Found ${genesisAddresses.size} unique genesis accounts.`);
+
+  if (genesisAddresses.size === 0) return;
+
+  const bootstrapHeight = BigInt(0);
+  const addressList = Array.from(genesisAddresses);
+  
   try {
+    const enrichedGenesisAccounts = await Promise.all(
+      addressList.map(async (addr) => {
+        try {
+          const acc = await fetchNodeJson<any>(`/balance/${addr}`);
+          return {
+            address: addr,
+            balance: acc.balance || "0",
+            staked: acc.staked || "0",
+            nonce: BigInt(acc.nonce ?? 0),
+            name: acc.name || "",
+            is_validator: Boolean(acc.is_validator),
+            validator_status: acc.validator_status || "None",
+            updated_at_block: bootstrapHeight,
+            stake_height: BigInt(acc.stake_height ?? 0),
+            vesting_initial_amount: acc.vesting_schedule?.initial_amount || "0",
+            vesting_lock_height: BigInt(acc.vesting_schedule?.lock_height ?? 0),
+          };
+        } catch (err: any) {
+          console.warn(`⚠️ Failed to fetch balance for genesis account ${addr}:`, err.message || err);
+          return {
+            address: addr,
+            balance: "0",
+            staked: "0",
+            nonce: BigInt(0),
+            name: "",
+            is_validator: false,
+            validator_status: "None",
+            updated_at_block: bootstrapHeight,
+            stake_height: BigInt(0),
+            vesting_initial_amount: "0",
+            vesting_lock_height: BigInt(0),
+          };
+        }
+      })
+    );
+
+    // Upsert each enriched account into database
+    for (const acc of enrichedGenesisAccounts) {
+      await prisma.account.upsert({
+        where: { address: acc.address },
+        update: {
+          balance: acc.balance,
+          staked: acc.staked,
+          nonce: acc.nonce,
+          name: acc.name,
+          is_validator: acc.is_validator,
+          validator_status: acc.validator_status,
+          updated_at_block: acc.updated_at_block,
+          stake_height: acc.stake_height,
+          vesting_initial_amount: acc.vesting_initial_amount,
+          vesting_lock_height: acc.vesting_lock_height,
+        },
+        create: acc,
+      });
+    }
+    console.log("✅ Genesis accounts registered and sync'ed with live node states in database.");
+  } catch (err: any) {
+    console.error("❌ Failed to register genesis accounts in database:", err.message || err);
+  }
+}
+
+async function bootstrapObservedAccounts() {
+  console.log("👤 Checking observed account registry in PostgreSQL...");
+  try {
+    const hasAccounts = await prisma.account.findFirst();
+    if (hasAccounts) {
+      console.log("👤 Account registry already bootstrapped. Skipping bootstrap registry query.");
+      return;
+    }
+
+    console.log("👤 Bootstrapping observed account registry from PostgreSQL (first time setup)...");
     const txAddresses = await prisma.$queryRaw<Array<{ address: string }>>`
       SELECT DISTINCT address FROM (
         SELECT "from" AS address FROM "Transaction"
@@ -258,11 +412,20 @@ function toTxSummary(payload: NodeBlockPayload, txData: NodeTransactionPayload) 
     to: txData.to,
     to_name: txData.to_name || "",
     value: txData.value || "0",
+    nonce: Number(txData.nonce ?? 0),
     status: txData.status || "SUCCESS",
     method: txData.method || "TRANSFER",
     token_info: txData.token_info ?? null,
     timestamp: Number(payload.timestamp),
     block_height: Number(payload.height),
+    data: txData.data || "",
+    signature: txData.signature || "",
+    pubkey: txData.pubkey || "",
+    fee: txData.fee || "0",
+    fee_payer: txData.fee_payer || null,
+    fee_payer_name: txData.fee_payer_name || null,
+    fee_payer_signature: txData.fee_payer_signature || null,
+    fee_payer_pubkey: txData.fee_payer_pubkey || null,
   };
 }
 
@@ -280,6 +443,9 @@ async function cacheBlockPayload(payload: NodeBlockPayload, statsFallback?: Part
       const txSummaryStr = JSON.stringify(toTxSummary(payload, txData));
       await redis.lrem(LATEST_TXS_KEY, 0, txSummaryStr);
       await redis.lpush(LATEST_TXS_KEY, txSummaryStr);
+      // Clean from mempool cache
+      await redis.del(`lumina:mempool:${txData.hash}`);
+      await redis.srem("lumina:mempool_hashes", txData.hash);
     }
     await redis.ltrim(LATEST_TXS_KEY, 0, RECENT_TXS_LIMIT - 1);
   }
@@ -467,7 +633,39 @@ async function indexBlockPayload(payload: NodeBlockPayload, skipAccountUpdate = 
     if (payload.transactions && Array.isArray(payload.transactions)) {
       for (const txData of payload.transactions) {
         const tokenInfoJson = txData.token_info ? JSON.stringify(txData.token_info) : null;
+        let tokenRecipient: string | null = null;
+        if (txData.token_info) {
+          const parsed = parseTokenInfo(txData.token_info);
+          if (parsed && parsed.token_recipient) {
+            tokenRecipient = parsed.token_recipient;
+          }
+        }
+        const rawMethod = txData.method || "";
+        const rawData = txData.data || "";
+        // Flexible method detection: use explicit method first, fallback to data sniff
+        let resolvedMethod = rawMethod;
+        if (!resolvedMethod || resolvedMethod === "TRANSFER") {
+          const dataUpper = rawData.toUpperCase();
+          if (dataUpper.startsWith("4445504c4f593a") || dataUpper.startsWith("DEPLOY:")) resolvedMethod = "DEPLOY";
+          else if (dataUpper.startsWith("5354414b453a") || dataUpper.startsWith("STAKE:")) resolvedMethod = "STAKE";
+          else if (dataUpper.startsWith("5553544b3a") || dataUpper.startsWith("UNSTAKE:") || dataUpper.startsWith("554e5354414b45")) resolvedMethod = "UNSTAKE";
+          else if (dataUpper.startsWith("43414c4c3a") || dataUpper.startsWith("CALL:")) resolvedMethod = "CALL";
+          else if (rawData.length > 0) resolvedMethod = "TRANSFER"; // has data but unknown
+          else resolvedMethod = "TRANSFER";
+        }
+        // Also detect DEPLOY from status format
+        const statusUpper = (txData.status || "").toUpperCase();
+        if (statusUpper.startsWith("SUCCESS:CID:") || statusUpper.startsWith("SUCCESS_CID:")) {
+          resolvedMethod = "DEPLOY";
+        }
         const nonce = BigInt(txData.nonce ?? 0);
+        // Extract contract ID from status field flexibly
+        let deployedContractId: string | null = null;
+        const statusRaw = txData.status || "";
+        const cidMatch = statusRaw.match(/(?:SUCCESS|success):CID:([^:]+)/i) || statusRaw.match(/(?:SUCCESS|success)_CID:([^:]+)/i);
+        if (cidMatch && cidMatch[1]) {
+          deployedContractId = cidMatch[1].trim();
+        }
         await tx.transaction.upsert({
           where: { hash: txData.hash },
           update: {
@@ -479,8 +677,17 @@ async function indexBlockPayload(payload: NodeBlockPayload, skipAccountUpdate = 
             value: txData.value || "0",
             nonce,
             status: txData.status || "SUCCESS",
-            method: txData.method || "TRANSFER",
+            method: resolvedMethod,
             token_info: tokenInfoJson,
+            token_recipient: tokenRecipient,
+            data: txData.data || "",
+            signature: txData.signature || "",
+            pubkey: txData.pubkey || "",
+            fee: txData.fee || "0",
+            fee_payer: txData.fee_payer || null,
+            fee_payer_name: txData.fee_payer_name || null,
+            fee_payer_signature: txData.fee_payer_signature || null,
+            fee_payer_pubkey: txData.fee_payer_pubkey || null,
           },
           create: {
             hash: txData.hash,
@@ -492,10 +699,67 @@ async function indexBlockPayload(payload: NodeBlockPayload, skipAccountUpdate = 
             value: txData.value || "0",
             nonce,
             status: txData.status || "SUCCESS",
-            method: txData.method || "TRANSFER",
+            method: resolvedMethod,
             token_info: tokenInfoJson,
+            token_recipient: tokenRecipient,
+            data: txData.data || "",
+            signature: txData.signature || "",
+            pubkey: txData.pubkey || "",
+            fee: txData.fee || "0",
+            fee_payer: txData.fee_payer || null,
+            fee_payer_name: txData.fee_payer_name || null,
+            fee_payer_signature: txData.fee_payer_signature || null,
+            fee_payer_pubkey: txData.fee_payer_pubkey || null,
           },
         });
+
+        // Index contract if deployed — support multiple status formats
+        if (deployedContractId) {
+          const cid = deployedContractId;
+          let bytecode = "";
+          if (txData.data) {
+            const hexPrefix = "4445504c4f593a"; // "DEPLOY:" in hex
+            const dataLower = txData.data.toLowerCase();
+            if (dataLower.startsWith(hexPrefix)) {
+              bytecode = txData.data.substring(hexPrefix.length);
+            } else if (txData.data.toUpperCase().startsWith("DEPLOY:")) {
+              bytecode = txData.data.substring(7);
+            } else {
+              bytecode = txData.data;
+            }
+          }
+
+          const tokenInfo = parseTokenInfo(txData.token_info);
+          await tx.contract.upsert({
+            where: { address: cid },
+            update: {
+              tx_hash: txData.hash,
+              block_height: height,
+              bytecode,
+              name: tokenInfo?.token_name || null,
+              symbol: tokenInfo?.token_symbol || null,
+              decimals: tokenInfo?.decimals !== undefined ? Number(tokenInfo.decimals) : null,
+              total_supply: tokenInfo?.token_amount || null,
+              owner: tokenInfo?.owner || txData.from,
+              logo: tokenInfo?.logo || null,
+              created_at: timestamp,
+            },
+            create: {
+              address: cid,
+              tx_hash: txData.hash,
+              block_height: height,
+              bytecode,
+              name: tokenInfo?.token_name || null,
+              symbol: tokenInfo?.token_symbol || null,
+              decimals: tokenInfo?.decimals !== undefined ? Number(tokenInfo.decimals) : null,
+              total_supply: tokenInfo?.token_amount || null,
+              owner: tokenInfo?.owner || txData.from,
+              logo: tokenInfo?.logo || null,
+              created_at: timestamp,
+            }
+          });
+          console.log(`📄 Indexed contract ${cid} from tx ${txData.hash.substring(0, 12)}...`);
+        }
       }
     }
   });
@@ -608,12 +872,34 @@ async function main() {
 
   await hydrateCachesFromDatabase();
   await bootstrapObservedAccounts();
+  await registerGenesisAccounts();
 
   // Start WebSocket client to ingest data from Lumina Node
   startWebSocketIngestion();
 
   await bootstrapHistoricalBlocks();
   await hydrateCachesFromDatabase();
+
+  // Periodically fetch and cache network validators and peers
+  setInterval(async () => {
+    try {
+      const validators = await fetchNodeJson<any>("/network/validators");
+      if (validators && validators.validators) {
+        await redis.set("lumina:network:validators", JSON.stringify(validators), "EX", 30);
+      }
+    } catch (err) {
+      console.warn("⚠️ Background validator sync failed:", err);
+    }
+
+    try {
+      const peers = await fetchNodeJson<any>("/network/peers");
+      if (peers && peers.peers) {
+        await redis.set("lumina:network:peers", JSON.stringify(peers), "EX", 30);
+      }
+    } catch (err) {
+      console.warn("⚠️ Background peer sync failed:", err);
+    }
+  }, 10000); // every 10 seconds
 }
 
 function startWebSocketIngestion() {
@@ -626,7 +912,7 @@ function startWebSocketIngestion() {
 
   ws.on("message", async (data) => {
     try {
-      const msg = JSON.parse(data.toString()) as NodeBlockPayload;
+      const msg = JSON.parse(data.toString()) as any;
       if (msg.type === "new_block" || msg.type === "sync_block") {
         console.log(`📦 Received block #${msg.height} from Node. Ingesting...`);
 
@@ -641,6 +927,27 @@ function startWebSocketIngestion() {
         // 3. Pub ke Redis untuk Express WebSocket server menyiarkan ke frontend
         if (msg.type === "new_block") {
           await redisPub.publish("lumina:block_channel", JSON.stringify(msg));
+        }
+      } else if (msg.type === "batch_transactions" && Array.isArray(msg.transactions)) {
+        // Cache these transactions in Redis
+        for (const tx of msg.transactions) {
+          const txKey = `lumina:mempool:${tx.hash}`;
+          const method = tx.method || (tx.data && tx.data.startsWith("STAKE") ? "STAKE" : "TRANSFER");
+          const txSummary = {
+            hash: tx.hash,
+            from: tx.from,
+            from_name: tx.from_name || "",
+            to: tx.to,
+            to_name: tx.to_name || "",
+            value: tx.value || "0",
+            nonce: Number(tx.nonce ?? 0),
+            status: "Pending",
+            method,
+            token_info: tx.token_info || null,
+            timestamp: Math.floor(Date.now() / 1000)
+          };
+          await redis.set(txKey, JSON.stringify(txSummary), "EX", 300); // 5 minutes TTL
+          await redis.sadd("lumina:mempool_hashes", tx.hash);
         }
       }
     } catch (err) {

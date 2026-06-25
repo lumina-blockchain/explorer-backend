@@ -21,8 +21,17 @@ const MAX_INTERNAL_TX_PAGE_SIZE = 100;
 const MAX_CONTRACT_EVENT_LIMIT = 100;
 const MAX_TOKEN_DISCOVERY_TXS = 2000;
 
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"],
+  exposedHeaders: ["Content-Length", "Content-Range"],
+  optionsSuccessStatus: 204,
+};
+
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // Enable pre-flight for all routes
 app.use(express.json());
 
 const server = http.createServer(app);
@@ -124,20 +133,10 @@ async function getCachedJson<T>(key: string): Promise<T | null> {
 }
 
 async function contractBytecodeExists(address: string): Promise<boolean> {
-  const cacheKey = `lumina:contract:bytecode:${address}`;
-  const cached = await redis.get(cacheKey);
-  if (cached === "1") return true;
-  if (cached === "0") return false;
-
-  try {
-    const data = await proxyToNode(`/contract/${address}/bytecode`, "GET");
-    const exists = Boolean(data?.bytecode);
-    await redis.set(cacheKey, exists ? "1" : "0", "EX", CONTRACT_BYTECODE_CACHE_TTL_SECONDS);
-    return exists;
-  } catch {
-    await redis.set(cacheKey, "0", "EX", 60);
-    return false;
-  }
+  const count = await prisma.contract.count({
+    where: { address },
+  });
+  return count > 0;
 }
 
 async function buildContractSummary(address: string) {
@@ -147,39 +146,27 @@ async function buildContractSummary(address: string) {
     return cached;
   }
 
-  const relatedTxs = await prisma.transaction.findMany({
-    where: {
-      OR: [
-        { token_info: { contains: `"contract_id":"${address}"` } },
-        { to: address },
-      ],
-    },
-    orderBy: { block_height: "desc" },
-    take: 25,
+  const contract = await prisma.contract.findUnique({
+    where: { address },
   });
 
-  const tokenSignals = relatedTxs
-    .map((tx) => parseTokenInfo(tx.token_info))
-    .filter((info): info is NonNullable<ParsedTokenInfo> => Boolean(info?.contract_id === address));
-
-  const hasBytecode = await contractBytecodeExists(address);
-  const isToken = tokenSignals.length > 0;
-
-  if (!hasBytecode && !isToken) {
+  if (!contract) {
     return { error: "Not a contract address" };
   }
 
-  const firstTokenSignal = tokenSignals[0];
   const metadata: Record<string, string> = {};
-  if (firstTokenSignal?.token_name) metadata.name = firstTokenSignal.token_name;
-  if (firstTokenSignal?.token_symbol) metadata.symbol = firstTokenSignal.token_symbol;
-  if (firstTokenSignal?.logo) metadata.logo = firstTokenSignal.logo;
-  if (firstTokenSignal?.owner) metadata.owner = firstTokenSignal.owner;
-  if (firstTokenSignal?.decimals !== undefined) metadata.decimals = String(firstTokenSignal.decimals);
+  if (contract.name) metadata.name = contract.name;
+  if (contract.symbol) metadata.symbol = contract.symbol;
+  if (contract.logo) metadata.logo = contract.logo;
+  if (contract.owner) metadata.owner = contract.owner;
+  if (contract.decimals !== null && contract.decimals !== undefined) {
+    metadata.decimals = String(contract.decimals);
+  }
+  if (contract.total_supply) metadata.total_supply = contract.total_supply;
 
   const summary = {
     address,
-    contract_type: isToken ? "Token (LTS-20)" : "Smart Contract / DApp",
+    contract_type: contract.symbol ? "Token (LTS-20)" : "Smart Contract / DApp",
     metadata,
     abi: [],
   };
@@ -205,34 +192,41 @@ async function hasIndexedAccountState(): Promise<boolean> {
   return Boolean(result[0]?.has_state);
 }
 
+let lastKnownTotalAccounts = 250000;
+let isCountingAccounts = false;
+
 // Helper to fetch total accounts dynamically from local DB/cache only.
 async function getTotalAccounts(): Promise<number> {
   const cached = await redis.get(TOTAL_ACCOUNTS_KEY);
   if (cached) {
-    return parseInt(cached, 10);
-  }
-
-  try {
-    const accountCount = await prisma.account.count();
-    if (accountCount > 0) {
-      await redis.set(TOTAL_ACCOUNTS_KEY, accountCount.toString(), "EX", 300);
-      return accountCount;
+    const parsed = parseInt(cached, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      lastKnownTotalAccounts = parsed;
+      return parsed;
     }
-
-    const result = await prisma.$queryRaw<Array<{ count: bigint }>>`
-      SELECT COUNT(DISTINCT address) as count FROM (
-        SELECT "from" AS address FROM "Transaction"
-        UNION
-        SELECT "to" AS address FROM "Transaction"
-      ) AS unique_addresses
-    `;
-    const count = Number(result[0]?.count ?? 0n);
-    await redis.set(TOTAL_ACCOUNTS_KEY, count.toString(), "EX", 300);
-    return count;
-  } catch (err) {
-    console.error("Error fetching total accounts from DB:", err);
-    return 0;
   }
+
+  // If not cached and not currently counting, trigger count in the background
+  if (!isCountingAccounts) {
+    isCountingAccounts = true;
+    (async () => {
+      try {
+        console.log("📊 Starting background account count query...");
+        const count = await prisma.account.count();
+        if (count > 0) {
+          lastKnownTotalAccounts = count;
+          await redis.set(TOTAL_ACCOUNTS_KEY, count.toString(), "EX", 7200); // Cache for 2 hours
+          console.log(`📊 Background account count query finished: ${count}`);
+        }
+      } catch (err) {
+        console.error("Error fetching total accounts in background:", err);
+      } finally {
+        isCountingAccounts = false;
+      }
+    })();
+  }
+
+  return lastKnownTotalAccounts;
 }
 
 // Endpoint: /total_accounts
@@ -270,10 +264,8 @@ app.get("/network/stats", async (req, res) => {
     const cachedStats = safeJsonParse<any>(await redis.get(LATEST_STATS_KEY));
     const nodeStats = await fetchNetworkStatsFromNode();
     
-    const [totalTransactions, totalAccounts] = await Promise.all([
-      prisma.transaction.count(),
-      getTotalAccounts()
-    ]);
+    const totalAccounts = await getTotalAccounts();
+    const totalTransactions = Number(nodeStats?.total_transactions ?? cachedStats?.total_transactions ?? 0);
 
     if (cachedStats) {
       const response = toNetworkStatsResponse(cachedStats, nodeStats);
@@ -420,7 +412,6 @@ app.get("/txs_all", async (req, res) => {
     const page = parseInt(req.query.page as string) || 0;
     const limit = Math.min(100, parseInt(req.query.limit as string) || 10);
 
-    const total = await prisma.transaction.count();
     const txsDb = await prisma.transaction.findMany({
       orderBy: [{ block_height: "desc" }, { hash: "desc" }],
       skip: page * limit,
@@ -441,6 +432,10 @@ app.get("/txs_all", async (req, res) => {
       block_height: Number(t.block_height),
       timestamp: Number(t.block.timestamp),
     }));
+
+    // Dynamic total estimation to bypass expensive COUNT(*) queries
+    const hasMore = txsDb.length === limit;
+    const total = hasMore ? (page + 2) * limit : (page * limit) + txsDb.length;
 
     res.json({ transactions, total });
   } catch (err: any) {
@@ -523,7 +518,6 @@ app.get("/block/:id", async (req, res) => {
   }
 });
 
-// 7. Endpoint: /tx/:hash
 app.get("/tx/:hash", async (req, res) => {
   const requestedHash = req.params.hash;
   const normalizedHash = normalizeTxHash(requestedHash);
@@ -541,6 +535,13 @@ app.get("/tx/:hash", async (req, res) => {
     });
 
     if (txDb) {
+      // Fetch latest indexed block height for confirmation count
+      const latestBlock = await prisma.block.findFirst({
+        orderBy: { height: "desc" },
+        select: { height: true },
+      });
+      const latestHeight = latestBlock ? Number(latestBlock.height) : Number(txDb.block_height);
+
       return res.json({
         hash: txDb.hash,
         from: txDb.from,
@@ -549,25 +550,27 @@ app.get("/tx/:hash", async (req, res) => {
         to_name: txDb.to_name,
         value: txDb.value,
         nonce: Number(txDb.nonce),
-        data: "",
-        signature: "",
-        pubkey: "",
-        fee: "0",
+        data: txDb.data,
+        signature: txDb.signature,
+        pubkey: txDb.pubkey,
+        fee: txDb.fee,
+        fee_payer: txDb.fee_payer,
+        fee_payer_name: txDb.fee_payer_name,
+        fee_payer_signature: txDb.fee_payer_signature,
+        fee_payer_pubkey: txDb.fee_payer_pubkey,
         status: txDb.status,
         method: txDb.method,
         block_height: Number(txDb.block_height),
+        latest_height: latestHeight,
         timestamp: Number(txDb.block.timestamp),
         token_info: txDb.token_info ? JSON.parse(txDb.token_info) : null,
       });
     }
 
-    try {
-      const nodeTx = await proxyToNode(`/tx/${normalizedHash}`, "GET");
-      if (nodeTx && !nodeTx.error) {
-        return res.json(nodeTx);
-      }
-    } catch {
-      // Ignore node fallback errors and keep the backend response stable.
+    // Fallback: Check Redis mempool cache for pending tx
+    const mempoolTx = await redis.get(`lumina:mempool:${normalizedHash}`);
+    if (mempoolTx) {
+      return res.json(JSON.parse(mempoolTx));
     }
 
     return res.status(404).json({ error: "Transaction not found" });
@@ -583,23 +586,33 @@ app.get("/txs/:address", async (req, res) => {
   const limit = Math.min(100, parseInt(req.query.limit as string) || 10);
 
   try {
-    const total = await prisma.transaction.count({
-      where: {
-        OR: [{ from: address }, { to: address }],
-      },
-    });
+    // Fetch up to (page + 1) * limit rows from both directions
+    const fetchLimit = (page + 1) * limit;
 
-    const txsDb = await prisma.transaction.findMany({
-      where: {
-        OR: [{ from: address }, { to: address }],
-      },
+    const txsFrom = await prisma.transaction.findMany({
+      where: { from: address },
       orderBy: { block_height: "desc" },
-      skip: page * limit,
-      take: limit,
+      take: fetchLimit,
       include: { block: true },
     });
 
-    const transactions = txsDb.map((t) => ({
+    const txsTo = await prisma.transaction.findMany({
+      where: { to: address },
+      orderBy: { block_height: "desc" },
+      take: fetchLimit,
+      include: { block: true },
+    });
+
+    // Merge and sort in memory
+    const combined = [...txsFrom, ...txsTo]
+      .sort((a, b) => Number(b.block_height - a.block_height))
+      .slice(page * limit, (page + 1) * limit);
+
+    // Dynamic total estimation to bypass expensive COUNT(*) queries
+    const hasMore = combined.length === limit;
+    const total = hasMore ? (page + 2) * limit : (page * limit) + combined.length;
+
+    const transactions = combined.map((t) => ({
       hash: t.hash,
       from: t.from,
       from_name: t.from_name,
@@ -657,60 +670,163 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// 10. Endpoint: /accounts/top
-app.get("/accounts/top", async (req, res) => {
+let cachedTopAccounts: any[] = [];
+let isUpdatingTopAccounts = false;
+
+async function updateTopAccountsCache() {
+  if (isUpdatingTopAccounts) return;
+  isUpdatingTopAccounts = true;
   try {
-    const page = parseInt(req.query.page as string) || 0;
-    const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
-    const offset = page * limit;
-    const stateAvailable = await hasIndexedAccountState();
-
-    const totalResult = await prisma.$queryRaw<Array<{ count: bigint }>>`
-      SELECT COUNT(*) as count FROM "Account"
+    console.log("📊 Starting background top accounts query...");
+    // Fetch top 1000 accounts: prioritizing non-zero balance/staked accounts,
+    // and filling the rest with recently active accounts.
+    const accounts = await prisma.$queryRaw<Array<{
+      address: string;
+      balance: string;
+      staked: string;
+      nonce: bigint;
+      name: string;
+      is_validator: boolean;
+      validator_status: string;
+    }>>`
+      WITH non_zero AS (
+        SELECT address, balance, staked, nonce, name, is_validator, validator_status, updated_at_block
+        FROM "Account"
+        WHERE balance <> '0' OR staked <> '0'
+        ORDER BY CAST(balance AS NUMERIC) DESC, CAST(staked AS NUMERIC) DESC, nonce DESC, address ASC
+        LIMIT 1000
+      ),
+      recent_active AS (
+        SELECT address, balance, staked, nonce, name, is_validator, validator_status, updated_at_block
+        FROM "Account"
+        ORDER BY updated_at_block DESC, address ASC
+        LIMIT 1000
+      )
+      SELECT address, balance, staked, nonce, name, is_validator, validator_status
+      FROM (
+        SELECT address, balance, staked, nonce, name, is_validator, validator_status, updated_at_block, 1 as sort_priority
+        FROM non_zero
+        UNION ALL
+        SELECT address, balance, staked, nonce, name, is_validator, validator_status, updated_at_block, 2 as sort_priority
+        FROM recent_active
+        WHERE address NOT IN (SELECT address FROM non_zero)
+      ) AS combined
+      ORDER BY sort_priority ASC, CAST(balance AS NUMERIC) DESC, CAST(staked AS NUMERIC) DESC, updated_at_block DESC, address ASC
+      LIMIT 1000
     `;
-    const total = Number(totalResult[0]?.count ?? 0n);
-
-    const accounts = stateAvailable
-      ? await prisma.$queryRaw<Array<{
-          address: string;
-          balance: string;
-          staked: string;
-          nonce: bigint;
-          name: string;
-          is_validator: boolean;
-          validator_status: string;
-        }>>`
-          SELECT address, balance, staked, nonce, name, is_validator, validator_status
-          FROM "Account"
-          ORDER BY CAST(balance AS NUMERIC) DESC, CAST(staked AS NUMERIC) DESC, nonce DESC, address ASC
-          LIMIT ${limit} OFFSET ${offset}
-        `
-      : await prisma.$queryRaw<Array<{
-          address: string;
-          balance: string;
-          staked: string;
-          nonce: bigint;
-          name: string;
-          is_validator: boolean;
-          validator_status: string;
-        }>>`
-          SELECT address, balance, staked, nonce, name, is_validator, validator_status
-          FROM "Account"
-          ORDER BY updated_at_block DESC, address ASC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
 
     const formattedAccounts = accounts.map((acc) => ({
       ...acc,
       nonce: Number(acc.nonce),
     }));
 
+    cachedTopAccounts = formattedAccounts;
+    await redis.set("lumina:top_accounts_cache", JSON.stringify(formattedAccounts), "EX", 1800); // Cache in redis for 30 minutes
+    console.log(`📊 Background top accounts query finished: cached ${formattedAccounts.length} accounts.`);
+  } catch (err) {
+    console.error("❌ Error updating top accounts cache in background:", err);
+  } finally {
+    isUpdatingTopAccounts = false;
+  }
+}
+
+// Start background task (every 10 minutes)
+setInterval(updateTopAccountsCache, 600000);
+// Warm up cache 5 seconds after startup
+setTimeout(updateTopAccountsCache, 5000);
+
+// 10. Endpoint: /accounts/top
+app.get("/accounts/top", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 0;
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+    const offset = page * limit;
+
+    let accountsList = cachedTopAccounts;
+    if (accountsList.length === 0) {
+      const cached = await redis.get("lumina:top_accounts_cache");
+      if (cached) {
+        accountsList = JSON.parse(cached);
+        cachedTopAccounts = accountsList;
+      }
+    }
+
+    if (accountsList.length === 0) {
+      updateTopAccountsCache();
+      return res.json({
+        total: 0,
+        accounts: [],
+        page,
+        limit,
+        ranking_mode: "observed_recent",
+      });
+    }
+
+    const total = await getTotalAccounts();
+    const slicedAccounts = accountsList.slice(offset, offset + limit);
+
+    // Fetch live balance, staked, nonce from the node for the active page
+    const enrichedAccounts = await Promise.all(
+      slicedAccounts.map(async (acc: any) => {
+        try {
+          const cacheKey = `lumina:balance:${acc.address}`;
+          let data = safeJsonParse<any>(await redis.get(cacheKey));
+          if (!data) {
+            data = await proxyToNode(`/balance/${acc.address}`, "GET");
+            await redis.set(cacheKey, JSON.stringify(data), "EX", 120); // cache in redis for 2 minutes
+          }
+          if (data) {
+            // Asynchronously update database if values differ
+            if (
+              acc.balance !== data.balance ||
+              acc.staked !== data.staked ||
+              acc.nonce !== Number(data.nonce ?? 0) ||
+              acc.name !== (data.name || "") ||
+              acc.is_validator !== Boolean(data.is_validator) ||
+              acc.validator_status !== (data.validator_status || "None")
+            ) {
+              prisma.account.update({
+                where: { address: acc.address },
+                data: {
+                  balance: data.balance || "0",
+                  staked: data.staked || "0",
+                  nonce: BigInt(data.nonce ?? 0),
+                  is_validator: Boolean(data.is_validator),
+                  validator_status: data.validator_status || "None",
+                  name: data.name || "",
+                },
+              }).catch((err) => {
+                console.error(`Failed to update DB account status for ${acc.address}:`, err);
+              });
+            }
+
+            return {
+              ...acc,
+              balance: data.balance || "0",
+              staked: data.staked || "0",
+              nonce: Number(data.nonce ?? 0),
+              is_validator: Boolean(data.is_validator),
+              validator_status: data.validator_status || "None",
+              name: data.name || acc.name,
+            };
+          }
+        } catch (err) {
+          console.warn(`⚠️ Failed to fetch balance from node for ${acc.address}:`, err);
+        }
+        return acc;
+      })
+    );
+
+    // Determine ranking mode dynamically based on whether actual balances exist in the enriched list
+    const hasBalances = enrichedAccounts.some(acc => acc.balance !== "0" || acc.staked !== "0");
+    const ranking_mode = hasBalances ? "balance" : "observed_recent";
+
     res.json({
       total,
-      accounts: formattedAccounts,
+      accounts: enrichedAccounts,
       page,
       limit,
-      ranking_mode: stateAvailable ? "balance" : "observed_recent",
+      ranking_mode,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -764,18 +880,27 @@ app.get("/tokens/:address", async (req, res) => {
   const { address } = req.params;
 
   try {
-    const txs = await prisma.transaction.findMany({
-      where: {
-        token_info: { not: null },
-        OR: [
-          { from: address },
-          { to: address },
-          { token_info: { contains: `"token_recipient":"${address}"` } },
-        ],
-      },
+    // Fetch from, to, and token_recipient transactions separately
+    const txsFrom = await prisma.transaction.findMany({
+      where: { from: address },
       orderBy: { block_height: "desc" },
       take: MAX_TOKEN_DISCOVERY_TXS,
     });
+
+    const txsTo = await prisma.transaction.findMany({
+      where: { to: address },
+      orderBy: { block_height: "desc" },
+      take: MAX_TOKEN_DISCOVERY_TXS,
+    });
+
+    const txsRecipient = await prisma.transaction.findMany({
+      where: { token_recipient: address },
+    });
+
+    // Merge and sort in memory
+    const txs = [...txsFrom, ...txsTo, ...txsRecipient]
+      .sort((a, b) => Number(b.block_height - a.block_height))
+      .slice(0, MAX_TOKEN_DISCOVERY_TXS);
 
     const tokenMap = new Map<string, { contract: string; name: string; symbol: string; logo: string; balance: bigint }>();
 
@@ -833,12 +958,7 @@ app.get("/contract/:address/events", async (req, res) => {
 
   try {
     const txs = await prisma.transaction.findMany({
-      where: {
-        OR: [
-          { to: address },
-          { token_info: { contains: `"contract_id":"${address}"` } },
-        ],
-      },
+      where: { to: address },
       orderBy: { block_height: "desc" },
       take: limit,
       include: { block: true },
@@ -894,47 +1014,121 @@ app.get("/contract/:address", async (req, res) => {
   }
 });
 
-// 11. Endpoint: /mempool/recent (Option B: proxy to node with timeout 3s, return [] if failed)
+// 11. Endpoint: /mempool/recent (100% Redis-backed offline query)
 app.get("/mempool/recent", async (req, res) => {
   try {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), 3000);
-    
-    const url = `${NODE_RPC_URL}/mempool/recent`;
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(id);
-    
-    if (!response.ok) {
-      throw new Error(`Node responded with status ${response.status}`);
+    const hashes = await redis.smembers("lumina:mempool_hashes");
+    if (!hashes || hashes.length === 0) {
+      return res.json([]);
     }
-    
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.warn("⚠️ Mempool proxy failed or timed out. Returning empty array.");
+    const pipeline = redis.pipeline();
+    for (const hash of hashes) {
+      pipeline.get(`lumina:mempool:${hash}`);
+    }
+    const results = await pipeline.exec();
+    const txs: any[] = [];
+    for (const r of results || []) {
+      if (r[0] === null && r[1]) {
+        try {
+          txs.push(JSON.parse(r[1] as string));
+        } catch {
+          // ignore
+        }
+      }
+    }
+    txs.sort((a, b) => b.timestamp - a.timestamp);
+    res.json(txs.slice(0, 50));
+  } catch (err: any) {
+    console.error("⚠️ Failed to read mempool from Redis:", err);
     res.json([]);
   }
 });
 
-// 12. Endpoint: /network/validators (Option B: proxy to node with timeout 5s, return [] if failed)
+// 12. Endpoint: /network/validators (100% Redis-backed)
 app.get("/network/validators", async (req, res) => {
   try {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), 5000);
-    
-    const url = `${NODE_RPC_URL}/network/validators`;
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(id);
-    
+    const cached = await redis.get("lumina:network:validators");
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+  } catch (err) {
+    console.warn("⚠️ Network validators cache read failed:", err);
+  }
+  try {
+    const data = await proxyToNode("/network/validators", "GET");
+    return res.json(data);
+  } catch {
+    res.json({ validators: [] });
+  }
+});
+
+// 13. Endpoint: /network/peers (100% Redis-backed)
+app.get("/network/peers", async (req, res) => {
+  try {
+    const cached = await redis.get("lumina:network:peers");
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+  } catch (err) {
+    console.warn("⚠️ Network peers cache read failed:", err);
+  }
+  try {
+    const data = await proxyToNode("/network/peers", "GET");
+    return res.json(data);
+  } catch {
+    res.json({ peers: [] });
+  }
+});
+
+// 14. Endpoint: /contract/:address/bytecode (Retrieve bytecode offline from postgres)
+app.get("/contract/:address/bytecode", async (req, res) => {
+  const { address } = req.params;
+  try {
+    const contract = await prisma.contract.findUnique({
+      where: { address },
+      select: { bytecode: true },
+    });
+    if (contract) {
+      return res.json({ bytecode: contract.bytecode });
+    }
+    return res.status(404).json({ error: "Contract bytecode not found" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 15. Endpoint: /contract/:id/call/:method (Smart contract VM read call with tight 2s abort signal)
+app.get("/contract/:id/call/:method", async (req, res) => {
+  const { id, method } = req.params;
+  const cacheKey = `lumina:contract:call:${id}:${method}:${JSON.stringify(req.query)}`;
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  try {
+    const url = `${NODE_RPC_URL}${req.originalUrl}`;
+    const response = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(2000),
+    });
     if (!response.ok) {
       throw new Error(`Node responded with status ${response.status}`);
     }
-    
     const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.warn("⚠️ Network validators proxy failed or timed out. Returning empty array.");
-    res.json([]);
+    try {
+      await redis.set(cacheKey, JSON.stringify(data), "EX", 10);
+    } catch {
+      // ignore
+    }
+    return res.json(data);
+  } catch (err: any) {
+    console.warn(`⚠️ Contract call fallback failed or timed out: ${err.message}`);
+    return res.status(504).json({ error: "Contract call timeout or node unavailable" });
   }
 });
 
